@@ -1,3 +1,9 @@
 *.log
 **/tmp/*
 /clip-vit-base-patch32
+/demo/lightning_logs
+/demo/__pycache__
+/losses/__pycache__
+/models/__pycache__
+/pl_modules/__pycache__
+/__pycache__
