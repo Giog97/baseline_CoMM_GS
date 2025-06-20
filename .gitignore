@@ -2,6 +2,7 @@
 **/tmp/*
 /clip-vit-base-patch32
 /demo/lightning_logs
+/demo/wandb
 /demo/__pycache__
 /losses/__pycache__
 /models/__pycache__

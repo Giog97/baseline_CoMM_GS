@@ -28,6 +28,7 @@ class CoMMLoss(nn.Module):
         sim_zii= (z1 @ z1.T) / self.temperature # dim [N, N] => Upper triangle contains incorrect pairs
         # sim intra-z2
         sim_zjj = (z2 @ z2.T) / self.temperature # dim [N, N] => Upper triangle contains incorrect pairs
+        
         # Similarità inter-modale (z1 vs z2)
         sim_zij = (z1 @ z2.T) / self.temperature # dim [N, N] => the diag contains the correct pairs (i,j)
         
@@ -45,9 +46,18 @@ class CoMMLoss(nn.Module):
         
         # Applica la log-softmax riga per riga
         log_sim_Z = func.log_softmax(sim_Z, dim=1)
+
         # La loss si ottiene considerando la diagonale come ground-truth
         loss = - torch.diag(log_sim_Z).mean()
-        return loss
+
+        # ToDo: Rimuovere accuracy
+        # Calcola anche l'accuratezza SSL (self-supervised learning):
+        # compute SSL accuracy
+        with torch.no_grad():
+            pred = torch.argmax(sim_zij, dim=1)
+            correct = pred.eq(torch.arange(N, device=z1.device)).sum()
+            acc = 100 * correct / N
+        return loss, acc # ToDo: Rimuovere accuracy
 
     def forward(self, outputs):
         """
@@ -75,20 +85,26 @@ class CoMMLoss(nn.Module):
         # Calcola la InfoNCE loss tra ciascun embedding e il prototipo
         # Apply InfoNCE between a "prototype embedding" and all the others
         loss = []
+        #acc = [] # ToDo: Rimuovere accuracy
         for i in range(n_emb):
-            loss1 = self.infonce(z1[i], z2[prototype]) # aug1[i] vs aug2[prototype]
-            loss2 = self.infonce(z2[i], z1[prototype]) # aug2[i] vs aug1[prototype]
+            loss1, acc1 = self.infonce(z1[i], z2[prototype]) # aug1[i] vs aug2[prototype]
+            loss2, acc2 = self.infonce(z2[i], z1[prototype]) # aug2[i] vs aug1[prototype]
             loss.append((loss1 + loss2) / 2.)
+            #acc.append((acc1 + acc2) / 2.) # ToDo: Rimuovere accuracy
+        
         # Crea dict per loggare le metriche separatamente
-        #losses = {"ssl_loss_%i"%i: l for i, l in enumerate(loss)}
+        #ssl_acc = {"ssl_acc_%i"%i: acc_ for i, acc_ in enumerate(acc)} # ToDo: Rimuovere accuracy
+        losses = {"ssl_loss_%i"%i: l for i, l in enumerate(loss)}
 
         # Se presenti, applica i pesi alle loss --> di default weights = None
         if self.weights is not None:
             loss = torch.mean(torch.stack(loss) * torch.tensor(self.weights, device=z1[0].device))
         else:
             loss = torch.mean(torch.stack(loss)) # Fa una media delle Loss
+        #acc = torch.mean(torch.stack(acc))
+
         # Ritorna tutto per il logger
-        return {"loss": loss} #{"loss": loss, **losses} # NB: Rimossa accuracy 
+        return {"loss": loss, **losses} #"ssl_acc": acc, **ssl_acc, **losses} # ToDo: Rimuovere accuracy
 
     def __str__(self):
         return "{}(temp={})".format(type(self).__name__, self.temperature)

@@ -352,45 +352,45 @@ def all_gather_batch(tensors):
     return output_tensor
 
 
-class GatherLayer(autograd.Function):
+class GatherLayer(autograd.Function): # Funzione custom di autograd
     """
     Gather tensors from all workers with support for backward propagation:
     This implementation does not cut the gradients as torch.distributed.all_gather does.
     """
+    # Estende torch.autograd.Function per definire esplicitamente forward e backward, che permette di personalizzare la propagazione dei gradienti
+    @staticmethod
+    def forward(ctx, x): # Riceve in input x, un tensore da un processo (es. una GPU)
+        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())] # Prepara una lista output con un tensore vuoto (di stessa forma) per ogni processo
+        dist.all_gather(output, x) # Raccoglie (all_gather) il tensore x da tutti i processi e li mette nella lista output
+        return tuple(output) # Restituisce un tupla di tensori (uno per ogni GPU/processo).
 
     @staticmethod
-    def forward(ctx, x):
-        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
-        dist.all_gather(output, x)
-        return tuple(output)
-
-    @staticmethod
-    def backward(ctx, *grads):
-        all_gradients = torch.stack(grads)
-        dist.all_reduce(all_gradients)
-        return all_gradients[dist.get_rank()]
+    def backward(ctx, *grads): # grads contiene i gradienti ricevuti da ciascuno dei tensori restituiti nel forward
+        all_gradients = torch.stack(grads) # Li impila in un solo tensore all_gradients
+        dist.all_reduce(all_gradients) # Esegue una all-reduce: somma i gradienti tra tutti i processi, così ogni processo riceve la somma totale.
+        return all_gradients[dist.get_rank()] # Ritorna solo il gradiente corrispondente al processo attuale, così ogni GPU applica il gradiente corretto al proprio x
 
 
-def all_gather_batch_with_grad(tensors):
+def all_gather_batch_with_grad(tensors): # Funziona in ambienti DDP (Distributed Data Parallel)
     """
     Performs all_gather operation on the provided tensors.
     Graph remains connected for backward grad computation.
     """
     # Queue the gathered tensors
-    world_size = get_world_size()
+    world_size = get_world_size() # Recupera il numero di processi coinvolti nel training distribuito
     # There is no need for reduction in the single-proc case
-    if world_size == 1:
+    if world_size == 1: # Se stai usando solo un processo (quindi no DDP), non c'è nulla da raccogliere: restituisce direttamente i tensori
         return tensors
-    tensor_list = []
-    output_tensor = []
+    tensor_list = [] # Conterrà i tensori raccolti per ogni input
+    output_tensor = [] # Conterrà i tensori finali concatenati
 
     for tensor in tensors:
-        tensor_all = GatherLayer.apply(tensor)
+        tensor_all = GatherLayer.apply(tensor) # chiama GatherLayer.apply(tensor), che è funzione custom di autograd per fare all_gather mantenendo il grafo computazionale.
         tensor_list.append(tensor_all)
 
     for tensor_all in tensor_list:
         output_tensor.append(torch.cat(tensor_all, dim=0))
-    return output_tensor
+    return output_tensor # Restituisce una lista di tensori concatenati, uno per ogni tensore originario, ma ora raccogliendo batch da tutti i processi.
 
 
 class LinearWarmupCosineAnnealingLR(LRScheduler):

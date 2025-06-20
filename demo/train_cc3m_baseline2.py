@@ -21,11 +21,14 @@ from pl_modules.comm import CoMM # Apprendimento multimodale contrastivo che con
 from models.mmfusion import MMFusion # Classe che fonde le rappresentazioni visive e testuali in una rappresentazione multimodale (Fusione avanzata di feature multimodali). [Importa MMFusion]
 from models.vit import VisionTransformer # Encoder per immagini basato su ViT. [Importa una versione Pre-trained vision transformers personalizzata del Vision Transformer (ViT)]
 from models.transformer import LanguageEncoder # Encoder per testo. [Importa LanguageEncoder, probabilmente una variante di Transformer per l'elaborazione del testo]
+from demo.cc3m_data_module import CC3MDataModule # File creato da me, che estende datamodule e serve per il dataloader
+from demo.cc3m_data_module import collate_fn
 
 # Import aggiuntivi
 import clip # Per farlo funzionare bisogna eseguire: pip install git+https://github.com/openai/CLIP.git 
 from torch.utils.data import DataLoader
 from cc3m_llava import CC3MLLaVaDataset  # Sfrutta il custom dataset/dataloader CC3M fornito da MISTRETTA
+from pytorch_lightning.loggers import WandbLogger # Per utilizzare la visualizzazione di Weights & Biases
 
 from transformers import logging as hf_logging
 hf_logging.set_verbosity_error() # Silenzia warning di Hugging Face # --> NB ci sono degli warning dovuti al fatto che Some weights of the model checkpoint at openai/clip-vit-base-patch32 were not used when initializing CLIPTextModel
@@ -38,62 +41,7 @@ np.random.seed(42)
 os.environ["TOKENIZERS_PARALLELISM"] = "false" # Avoid HF's warning 
 
 _, clip_preprocess = clip.load('ViT-B/32') # Carica il preprocessore CLIP
-
-# Funzione per preparare i batch nel formato che CoMM si aspetta
-# CoMM si aspetta coppie di viste aumentate di ogni modalità per contrastive learning
-# Per semplicità, usiamo le stesse immagini e testi per entrambe le viste
-def collate_fn(batch):
-    images = torch.stack([item['image'] for item in batch])
-    texts = [item['text'] for item in batch]
-    
-    # Ritorna (x1, x2) dove ogni xi è una lista di modalità
-    return ([images, texts], [images, texts]) # Due viste identiche (augmentation simulata)
-
-# Crea il DataModule per CC3M # --> similmente a come gli autori di CoMM definivano MMIMDBDataModule (in mmimdb.py)
-# Configura i DataLoader per training/validation con batch size e multi-threading.
-class CC3MDataModule(LightningDataModule):
-    def __init__(self, dataroot, preprocess, batch_size=64, num_workers=16, val_split=0.1):
-        super().__init__()
-        self.dataroot = dataroot
-        self.preprocess = preprocess
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.val_split = val_split
-        
-    def setup(self, stage=None):
-        full_dataset = CC3MLLaVaDataset(
-            dataroot=self.dataroot,
-            preprocess=self.preprocess,
-            return_image=True
-        )
-        total_size = len(full_dataset)
-        val_size = int(self.val_split * total_size)
-        train_size = total_size - val_size
-        
-        self.train_dataset, self.val_dataset = random_split(
-            full_dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)  # Per riproducibilità
-        )
-        
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=True,
-            collate_fn=collate_fn
-        )
-    
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
-            collate_fn=collate_fn
-        )
-
+#print(clip_preprocess)
 
 # Istanziazione e configurazione Dataloader
 data_module = CC3MDataModule(
@@ -101,7 +49,8 @@ data_module = CC3MDataModule(
     preprocess=clip_preprocess,
     batch_size=64,
     num_workers=16,
-    val_split=0.1  # Il 10% del dataset sarà usato per fare per validation
+    val_split=0.1,  # Il 10% del dataset sarà usato per fare per validation
+    test_split=0.1 # Il 10% del dataset sarà usato per fare per test
 )
 
 # Crea il modello CoMM standard
@@ -163,10 +112,21 @@ data_module.setup()
 
 # Training del modello
 #trainer = Trainer(max_epochs=1)  #(max_epochs=70) # 70 epoche di Train (NB: PyTorch Lightning gestisce automaticamente il loop di training)
-num_epochs=1 # Indica il numero di epoche che verranno eseguite
-# Provate num_epochs= 10, 20
+num_epochs=20 # Indica il numero di epoche che verranno eseguite
+check_val_every_n_epoch=5 # Significa che farà validation dopo x epoche
+print(f"[INFO] Numero di epoche che saranno eseguite: {num_epochs}") # Provate num_epochs= 10, 20, 3
+
+# Per avere i log con Weights & Biases # Da sistemare
+wandb_logger = WandbLogger(
+    name="comm_baseline_cc3m",
+    project="CoMM-CC3M"
+)
+
 trainer = Trainer(
     max_epochs=num_epochs, # Numero di epoche che verrano eseguite
+    check_val_every_n_epoch=check_val_every_n_epoch, # Significa che farà validation dopo x epoche
+    # Da sistemare il logger
+    logger=wandb_logger, # <--- qui viene usato Weights & Biases
     callbacks=[PrintParamsCallback()] # Serve per avere i print durante l'esecuzione
 )
 trainer.fit(comm, datamodule=data_module) # Usa loss contrastiva (implicitamente definita in CoMM). NB: avendo fornito validation_step e val_dataloader nel DataModule, la validazione viene eseguita automaticamente ad ogni fine epoca durante il training
