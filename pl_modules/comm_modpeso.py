@@ -7,6 +7,10 @@ from pl_modules.base import BaseModel
 from losses.comm_loss import CoMMLoss
 from models.mmfusion import MMFusion
 
+from demo.cc3m_sim_mat_recallk import compute_similarity_matrix
+from demo.cc3m_sim_mat_recallk import compute_recall_at_k
+from torchmetrics.retrieval import RetrievalRecall # Aggiunto per ottenere la RecallK di pytorch
+
 # Contrastive MultiModal learning (CoMM): Permette di apprendere rappresentazioni multimodali attraverso una singola rete (encoder multimodale) e una loss contrastiva.
 class CoMM(BaseModel):
     """ Contrastive MultiModal learning allowing the communication between modalities 
@@ -45,6 +49,18 @@ class CoMM(BaseModel):
         # Loss contrastiva per multimodalità
         self.loss = CoMMLoss(**loss_kwargs) # Inizializza la loss CoMM. La loss non ha parametri
 
+        # Aggiunto Serve per ottenere la Recall@K cpm K = 1, 5, 10
+        self.val_recalls_i2t = {
+            1: RetrievalRecall(top_k=1),
+            5: RetrievalRecall(top_k=5),
+            10: RetrievalRecall(top_k=10),
+        }
+        self.val_recalls_t2i = {
+            1: RetrievalRecall(top_k=1),
+            5: RetrievalRecall(top_k=5),
+            10: RetrievalRecall(top_k=10),
+        }
+
 
     @staticmethod
     def _build_mlp(in_dim, mlp_dim, out_dim): # Noi usiamo:  projection=CoMM._build_mlp(768, 512, 256)
@@ -77,12 +93,15 @@ class CoMM(BaseModel):
         """
         # Calcola tutte le possibili maschere per le modalità (masking multimodale)
         all_masks = self.gen_all_possible_masks(len(x1))
+
         # Encoder multimodale per x1 e x2
         z1 = self.encoder(x1, mask_modalities=all_masks)
         z2 = self.encoder(x2, mask_modalities=all_masks)
+
         # Passaggio attraverso la testa di proiezione
         z1 = [self.head(z) for z in z1]
         z2 = [self.head(z) for z in z2]
+
         # Restituisce un dizionario con embeddings
         return {'aug1_embed': z1,
                 'aug2_embed': z2,
@@ -107,35 +126,81 @@ class CoMM(BaseModel):
         masks.append([True for _ in range(n_mod)])
         return masks
     
-    # Da cambiare perchè richiede etichette
-    # Non viene usato attivamente dal nostro codice, ma pensato per essere usato manualmente.
+    # Cambiato Extrcat_features perchè richiedeva etichette (modificato rispetto all'originale)
     def extract_features(self, loader: torch.utils.data.DataLoader, **kwargs):
         """
-           Extract multimodal features (embedding) from the encoder (per tutti i dati nel loader).
-           Args:
-                loader: Dataset loader to serve `(X, y)` tuples. DataLoader che restituisce tuple (X, y)
-                kwargs: given to `encoder.forward()`. Argomenti addizionali per l'encoder
-           Returns: 
-                Pair (Z,y) corresponding to extracted features and corresponding labels
-                - X: features estratte (tensor)
-                - y: labels corrispondenti (tensor)
+        Extract multimodal features (embedding) from the encoder for all data in the loader.
+        Supporta sia batch in formato dizionario (default) che tuple usate nel contrastive learning.
+        
+        Returns:
+            X: extracted features (tensor)
+            names: image names (list of strings)
         """
-        X, y = [], []
-        # X per salvare le feature estratte (embedding)
-        # y per salvare le label (se presenti nel dataloader)
-        for X_, y_ in loader: # Si aspetta che il dataloader ritorni (X_, y_), dove X_ è una o più modalità (immagini, testi) e y_ sono le label (può essere anche dummy).
-            if isinstance(X_, torch.Tensor): # needs to cast it as list of one modality
-                # Se è un singolo tensore, lo mettiamo in lista (una sola modalità)
-                X_ = [X_]
-            # Spostiamo i dati sul device
-            X_ = [x.to(self.device) if isinstance(x, torch.Tensor) else x for x in X_]
-            y_ = y_.to(self.device)
+        X = []
+        names = []
+
+        for batch in loader:
+            # Supporto per entrambe le modalità di batch: dict o tuple
+            if isinstance(batch, dict):
+                images = batch.get("image", None)
+                texts = batch.get("text", None)
+                image_names = batch.get("image_name", None)
+            elif isinstance(batch, tuple):
+                x1, _ = batch  # batch = (x1, x2)
+                images, texts = x1  # x1 = [images, texts]
+                image_names = None
+            else:
+                raise ValueError("Formato batch non riconosciuto. Atteso dict o tuple.")
+
+            modalities = []
+            if images is not None:
+                images = images.to(self.device)
+                modalities.append(images)
+            if texts is not None:
+                if isinstance(texts, dict):  # Se è un batch tokenizzato
+                    texts = {k: v.to(self.device) for k, v in texts.items()}
+                else:
+                    texts = texts.to(self.device)
+                modalities.append(texts)
+
             with torch.inference_mode():
-                # compute output
-                # Calcolo output encoder
-                output = self.encoder(X_, **kwargs) # Passa i dati all’encoder multimodale del CoMM
-                # Estrae e "flattens" (se output è batch x mod x dim)
+                output = self.encoder(modalities, **kwargs)
                 X.extend(output.view(len(output), -1).detach().cpu())
-                y.extend(y_.detach().cpu())
+
+                if image_names is not None:
+                    names.extend(image_names)
+
         torch.cuda.empty_cache()
-        return torch.stack(X, dim=0).to(self.device), torch.stack(y, dim=0).to(self.device)
+        return torch.stack(X, dim=0).to(self.device), names
+
+    
+    # Sovrascrive on_validation_epoch_end (di LightningModule) in CoMM
+    # Sfrutta le funzioni 'compute_similarity_matrix' e 'compute_recall_at_k' per ottenere la recallK
+    """
+    def on_validation_epoch_end(self):
+        val_loader = self.trainer.datamodule.val_dataloader()
+
+        image_embeds, _ = self.extract_features(val_loader, mask_modalities=[[True, False]]) # Ritornerebbero anche i nomi ma non ci servono per il calolco delle similarità
+        text_embeds, _ = self.extract_features(val_loader, mask_modalities=[[False, True]])  # Ritornerebbero anche i nomi ma non ci servono per il calolco delle similarità
+
+        sim_matrix = compute_similarity_matrix(image_embeds, text_embeds)  # NxN
+
+        # I2T = ogni riga: un'immagine come query, colonne = testi
+        scores_i2t = sim_matrix
+        targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)  # Ground truth: diagonale
+
+        for k, metric in self.val_recalls_i2t.items():
+            metric.update(scores_i2t, targets)
+            self.log(f"val/image_to_text/recall@{k}", metric.compute(), prog_bar=True, on_epoch=True, sync_dist=True)
+            metric.reset()
+
+        # T2I = ogni riga: un testo come query, colonne = immagini
+        scores_t2i = sim_matrix.T  # trasponi la matrice
+        for k, metric in self.val_recalls_t2i.items():
+            metric.update(scores_t2i, targets)
+            self.log(f"val/text_to_image/recall@{k}", metric.compute(), prog_bar=True, on_epoch=True, sync_dist=True)
+            metric.reset()
+    """
+
+
+
